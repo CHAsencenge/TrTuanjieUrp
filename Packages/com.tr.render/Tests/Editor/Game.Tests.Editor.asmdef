@@ -1,0 +1,25 @@
+{
+    "name": "Game.Tests.Editor",
+    "rootNamespace": "Game.Tests.Editor",
+    "references": [
+        "Game.Rendering.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime",
+        "Unity.RenderPipelines.Core.Runtime"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS",
+        "ENABLE_UNIT_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

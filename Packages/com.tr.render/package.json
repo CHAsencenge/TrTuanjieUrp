@@ -1,0 +1,21 @@
+{
+    "name": "com.tr.render",
+    "version": "0.2.0",
+    "displayName": "TrRender",
+    "description": "A custom deferred rendering pipeline for URP, supporting extended GBuffer layout with multiple shading models (DefaultLit, Subsurface, ClearCoat, TwoSidedFoliage). Injects via ScriptableRendererFeature without modifying URP source.",
+    "unity": "2022.3",
+    "dependencies": {
+        "com.unity.render-pipelines.universal": "14.1.0",
+        "com.unity.render-pipelines.core": "14.1.0"
+    },
+    "keywords": [
+        "rendering",
+        "deferred",
+        "gbuffer",
+        "urp",
+        "shading-models"
+    ],
+    "author": {
+        "name": "Game Team"
+    }
+}
