@@ -1,0 +1,241 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+//#pragma use_dxc d3d11
+#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KShadowCopy                  KERNEL_SIZE=8   KERNEL_NAME_SHADOW_COPY=KShadowCopy
+#pragma kernel KShadowResize                KERNEL_SIZE=8   KERNEL_NAME_SHADOW_RESIZE=KShadowResize
+#pragma kernel KShadowResizeBatch8x8        KERNEL_SIZE=8   KERNEL_NAME_SHADOW_RESIZE_BATCH=KShadowResizeBatch8x8
+#pragma kernel KShadowResizeBatch16x16      KERNEL_SIZE=16  KERNEL_NAME_SHADOW_RESIZE_BATCH=KShadowResizeBatch16x16
+#pragma kernel Mip_Batch_Pass1              KERNEL_SIZE=8   KERNEL_NAME_MIP_BATCH=Mip_Batch_Pass1   BATCH_COUNT=1
+#pragma kernel Mip_Batch_Pass2              KERNEL_SIZE=2   KERNEL_NAME_MIP_BATCH=Mip_Batch_Pass2   BATCH_COUNT=2   USE_BATCH
+#pragma kernel Mip_Batch_Pass3              KERNEL_SIZE=4   KERNEL_NAME_MIP_BATCH=Mip_Batch_Pass3   BATCH_COUNT=3   USE_BATCH
+#pragma kernel Mip_Batch_Pass4              KERNEL_SIZE=8   KERNEL_NAME_MIP_BATCH=Mip_Batch_Pass4   BATCH_COUNT=4   USE_BATCH
+
+RW_TEXTURE2D_ARRAY(float, _DepthMipChain);
+RW_TEXTURE2D_ARRAY(float, _Result);
+RW_TEXTURE2D_ARRAY(float, _Source);
+
+TEXTURE2D_FLOAT(_ShadowSource);
+RW_TEXTURE2D_ARRAY(float, _ResizedShadow);
+RW_TEXTURE2D_ARRAY(float, _MipBatchResult0);
+RW_TEXTURE2D_ARRAY(float, _MipBatchResult1);
+RW_TEXTURE2D_ARRAY(float, _MipBatchResult2);
+RW_TEXTURE2D_ARRAY(float, _MipBatchResult3);
+
+CBUFFER_START(cb)
+    uint4 _SrcOffsetAndLimit; // {x, y, w - 1, h - 1}
+    uint4 _DstOffset;         // {x, y, 0, 0}
+    uint4 _RectOffset;
+    // The index x is unitLength.
+    uint4 _ShadowDepthParameters;
+CBUFFER_END
+
+#if UNITY_REVERSED_Z    // DX
+#define MIN_DEPTH(l, r) max(l, r)
+#define MAX_DEPTH(l, r) min(l, r)
+#else                   // opengl
+#define MIN_DEPTH(l, r) min(l, r)
+#define MAX_DEPTH(l, r) max(l, r)
+#endif
+
+uint2 GetSourceCoordsOffset(uint2 srcOffset, uint2 dstCoords, uint2 centerPixel, uint unitLength)
+{
+    return srcOffset + dstCoords % centerPixel * unitLength;
+}
+
+//--------------------------------------------------------------------------//
+//                         Shadow Resize Pass                               //
+//--------------------------------------------------------------------------//
+
+// @TODO: Just like Graphics.Blit, which one is faster?
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void KERNEL_NAME_SHADOW_COPY(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    _ResizedShadow[uint3(dispatchThreadId.xy, 0)] = _ShadowSource[dispatchThreadId.xy].x;
+}
+
+// Resize a Shadow Texture2D in Texture2DArray
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void KERNEL_NAME_SHADOW_RESIZE(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint unitLength = _ShadowDepthParameters.x;
+    uint2 srcOffset = dispatchThreadId.xy * unitLength;
+
+#if UNITY_REVERSED_Z
+    float minDepth = FLT_MAX;
+#else
+    float minDepth = -FLT_MAX;
+#endif
+
+    UNITY_LOOP
+    for (uint i = 0; i < unitLength; ++i)
+    {
+        UNITY_LOOP
+        for (uint j = 0; j < unitLength; ++j)
+        {
+            minDepth = MAX_DEPTH(minDepth, _ShadowSource[srcOffset + uint2(i, j)].x);
+        }
+    }
+
+    _ResizedShadow[uint3(dispatchThreadId.xy, 0)] = minDepth;
+}
+
+// We will merge KERNEL_SIZE * KERNEL_SIZE into one pixel within one ThreadGroup instead of one Thread.
+groupshared uint minDepth;
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void KERNEL_NAME_SHADOW_RESIZE_BATCH(uint3 dispatchThreadId : SV_DispatchThreadID, in uint3 _groupThreadID : SV_GroupThreadID)
+{
+    if (all(_groupThreadID.xy == uint2(0, 0)))
+#if UNITY_REVERSED_Z
+        minDepth = asuint(FLT_MAX);
+#else
+        minDepth = 0;
+#endif
+
+    GroupMemoryBarrierWithGroupSync();
+
+    float curDepth = _ShadowSource[dispatchThreadId.xy].x;
+#if UNITY_REVERSED_Z
+    InterlockedMin(minDepth, asuint(curDepth));
+#else
+    InterlockedMax(minDepth, asuint(curDepth));
+#endif
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (all(_groupThreadID.xy == uint2(0, 0)))
+    {
+        _ResizedShadow[uint3(dispatchThreadId.xy / KERNEL_SIZE, 0)] = asfloat(minDepth);
+    }
+}
+
+//--------------------------------------------------------------------------//
+//                             Mip Batch Pass                               //
+//--------------------------------------------------------------------------//
+uint2 SignedRightShift(uint x, const int2 bitshift)
+{
+    return bitshift >= 0 ? x << asuint(bitshift) : x >> asuint(-bitshift);
+}
+
+uint2 PosInTileFor2x2Merge(const uint log2GroupSizeXY, uint groupIndex1D)
+{
+    uint2 pos = uint2(0u, 0u);
+
+#if BATCH_COUNT > 2
+    UNITY_LOOP
+    for (uint i = 0; i < log2GroupSizeXY; i++)
+#else
+    uint i = 0;
+#endif
+    {
+        const uint curBitIndex = log2GroupSizeXY - 1 - i;
+        const uint curMask = 1u << curBitIndex;
+        const int baseShift = int(i * 2);
+        const int2 bitshift = int2(int(curBitIndex) - baseShift, int(curBitIndex) - (baseShift + 1));
+        pos |= SignedRightShift(groupIndex1D, bitshift) & curMask;
+    }
+
+    return pos;
+}
+
+float4 Gather4Depth(uint2 pixel)
+{
+    float p00 = _ResizedShadow[uint3(pixel + uint2(0u, 0u), 0)];
+    float p10 = _ResizedShadow[uint3(pixel + uint2(1u, 0u), 0)];
+    float p01 = _ResizedShadow[uint3(pixel + uint2(0u, 1u), 0)];
+    float p11 = _ResizedShadow[uint3(pixel + uint2(1u, 1u), 0)];
+    return float4(p00, p10, p01, p11);
+}
+
+void WriteDstPixelValue(uint mip, uint2 pixelPos, float depth)
+{
+#if BATCH_COUNT >= 2
+    if (mip == 1)
+    {
+        _MipBatchResult1[uint3(pixelPos, 0)] = depth;
+    }
+#endif
+
+#if BATCH_COUNT >= 3
+    else if (mip == 2)
+    {
+        _MipBatchResult2[uint3(pixelPos, 0)] = depth;
+    }
+#endif
+
+#if BATCH_COUNT >= 4
+    else if (mip == 3)
+    {
+        _MipBatchResult3[uint3(pixelPos, 0)] = depth;
+    }
+#endif
+}
+
+groupshared float _FarthestDepth[64];
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void KERNEL_NAME_MIP_BATCH(uint2 groupId : SV_GroupID, uint groupThreadIndex : SV_GroupIndex)
+{
+#ifndef USE_BATCH
+    uint2 groupThreadId = uint2(groupThreadIndex % KERNEL_SIZE, groupThreadIndex / KERNEL_SIZE);
+#else
+    uint2 groupThreadId = PosInTileFor2x2Merge(BATCH_COUNT - 1, groupThreadIndex);
+#endif
+
+    uint2 dispatchThreadId = KERNEL_SIZE * groupId + groupThreadId;
+
+    uint2 srcPixelUL = dispatchThreadId << 1;
+    uint2 dstPixelPos = dispatchThreadId;
+
+    // Use invalid value, i.e. the farthest value, to initialize.
+#if UNITY_REVERSED_Z
+    float minDepth = 0.0f;
+#else
+    float minDepth = 1.0f;
+#endif
+
+    float4 depths = Gather4Depth(srcPixelUL);
+    minDepth = MAX_DEPTH(MAX_DEPTH(depths.x, depths.y), MAX_DEPTH(depths.z, depths.w));
+
+    _MipBatchResult0[uint3(dstPixelPos, 0)] = minDepth;
+
+#ifdef USE_BATCH
+    _FarthestDepth[groupThreadIndex] = minDepth;
+#if BATCH_COUNT > 2
+    for (int mip = 1; mip < BATCH_COUNT; ++mip)
+#else
+    int mip = 1;
+#endif
+    {
+        const uint k_TileSize = uint(KERNEL_SIZE) >> mip;
+        const uint k_FlatTileSize = k_TileSize * k_TileSize;
+
+        GroupMemoryBarrierWithGroupSync();
+
+        UNITY_BRANCH
+        if (groupThreadIndex < k_FlatTileSize)
+        {
+            float parentDepths[4];
+            parentDepths[0] = minDepth;
+
+            UNITY_LOOP
+            for (uint i = 1; i < 4; i++)
+            {
+                uint index = groupThreadIndex + i * k_FlatTileSize;
+                parentDepths[i] = _FarthestDepth[index];
+            }
+
+            minDepth = MAX_DEPTH(MAX_DEPTH(parentDepths[0], parentDepths[1]), MAX_DEPTH(parentDepths[2], parentDepths[3]));
+
+            dstPixelPos = dstPixelPos >> 1;
+            WriteDstPixelValue(mip, dstPixelPos, minDepth);
+
+            _FarthestDepth[groupThreadIndex] = minDepth;
+        }
+    }
+#endif
+}
+
+#undef MIN_DEPTH
+#undef MAX_DEPTH

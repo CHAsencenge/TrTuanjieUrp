@@ -1,0 +1,204 @@
+#pragma only_renderers d3d11 vulkan glcore metal
+//#pragma enable_d3d11_debug_symbols
+
+#pragma kernel ReflectionProbeCull
+#pragma kernel InitReflectionProbeCull
+
+#pragma multi_compile _ _REFLECTION_PROBE_PRESENT
+
+#include "GPUDrivenCommon.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/Shaders/Utils/ReflectionProbeProperties.hlsl"
+
+#define THREAD_GROUP_SIZE_X         64
+
+uint _ActiveReflectionProbeCount;
+StructuredBuffer<InstanceVisible> _InstanceIDBuffer;
+RWStructuredBuffer<InstanceSubset> _RWInstanceSubsetBuffer;
+RWBuffer<uint> _ReflectionProbeCullArgsBuffer;
+
+struct AABB
+{
+    half3 boxMin;
+    half3 boxMax;
+};
+
+struct CompareInfo
+{
+    uint probeIndex;
+    uint importance;
+    half weight;
+    half distanceSqr;
+    AABB aabb;
+};
+
+CompareInfo CreateInitCompareInfo()
+{
+    CompareInfo info;
+    info.probeIndex = 0xFF;
+    info.importance = 0;
+    info.weight = 0.0h;
+    info.distanceSqr = HALF_MAX;
+    info.aabb = (AABB)0;
+
+    return info;
+}
+
+uint GetInstanceID(uint threadID)
+{
+    InstanceVisible visibleInfo = _InstanceIDBuffer[threadID + 1];
+    
+    return visibleInfo.instanceID;
+}
+
+bool IntersectionAABB(AABB a, AABB b, inout AABB intersection)
+{
+    bool intersect = true;
+
+    if (any(a.boxMin > b.boxMax) || any(a.boxMax < b.boxMin))
+        intersect = false;
+    
+    if (intersect)
+    {
+        intersection.boxMin = max(a.boxMin, b.boxMin);
+        intersection.boxMax = min(a.boxMax, b.boxMax);
+    }
+
+    return intersect;
+}
+
+half CalculateAABBVolume(AABB aabb)
+{
+    half3 size = aabb.boxMax - aabb.boxMin;
+
+    if (aabb.boxMax.x - aabb.boxMin.x <= HALF_EPS)
+        size.x = 1.0h;
+    if (aabb.boxMax.y - aabb.boxMin.y <= HALF_EPS)
+        size.y = 1.0h;
+    if (aabb.boxMax.z - aabb.boxMin.z <= HALF_EPS)
+        size.z = 1.0h;
+
+    return size.x * size.y * size.z;
+}
+
+half CalculateProbeInfluence(AABB object, AABB probe)
+{
+    half influence = -1.0h;
+    AABB intersection = (AABB)0;
+    if (IntersectionAABB(object, probe, intersection))
+    {
+        half volume = CalculateAABBVolume(intersection);
+        influence = max(HALF_EPS, volume);
+    }
+
+    return influence;
+}
+
+bool CompareProbeInfluence(CompareInfo info, CompareInfo newInfo)
+{
+    return (info.importance != newInfo.importance) ? (info.importance < newInfo.importance) :
+           (abs(info.weight - newInfo.weight) > HALF_EPS) ? (info.weight < newInfo.weight)  :
+           info.distanceSqr > newInfo.distanceSqr;
+}
+
+bool IsContainedInAABB(AABB smallBounds, AABB bigBounds)
+{
+    bool inside = all(smallBounds.boxMin > bigBounds.boxMin);
+    inside = inside && all(smallBounds.boxMax < bigBounds.boxMax);
+    return inside;
+}
+
+half CalculateReflectionProbeLerpValue(CompareInfo info0, CompareInfo info1, AABB objectAABB)
+{
+    if (info1.weight > 0.0h)
+    {
+        half objectVolume = CalculateAABBVolume(objectAABB);
+
+        if (info0.importance > info1.importance)
+            return saturate(info0.weight / objectVolume);
+        if (info1.importance > info0.importance)
+            return 1.0h - saturate(info1.weight / objectVolume);
+        
+        if (IsContainedInAABB(info0.aabb, info1.aabb))
+            return saturate(info0.weight / objectVolume);
+        if (IsContainedInAABB(info1.aabb, info0.aabb))
+            return 1.0h - saturate(info1.weight / objectVolume);
+        
+        return info0.weight / (info0.weight + info1.weight);
+    }
+
+    return 1.0h;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE_X, 1, 1)]
+void ReflectionProbeCull(in uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint threadID = dispatchThreadID.x;
+    uint instanceCount = _InstanceIDBuffer[0].instanceID;
+
+    if (threadID >= instanceCount)
+        return;
+
+    uint instanceID = GetInstanceID(threadID);
+
+#if _REFLECTION_PROBE_PRESENT
+    half3 objectBoundsCenter = GDRP_ACCESS_PROP(InstanceHeader, float3, boundsCenter, instanceID);
+    half3 objectBoundsExtents = GDRP_ACCESS_PROP(InstanceHeader, float3, boundsExtents, instanceID);
+    uint objectRenderingLayerMask = GDRP_ACCESS_PROP(InstanceHeader, uint, renderingLayerMask, instanceID);
+    AABB objectAABB;
+    objectAABB.boxMin = objectBoundsCenter - objectBoundsExtents;
+    objectAABB.boxMax = objectBoundsCenter + objectBoundsExtents;
+
+    CompareInfo compareInfo0 = CreateInitCompareInfo();
+    CompareInfo compareInfo1 = CreateInitCompareInfo();
+
+    for (uint i = 0; i < _ActiveReflectionProbeCount; ++i)
+    {
+        ReflectionProbeInfo probe = _ReflectionProbeInfoBuffer[i];
+        if (objectRenderingLayerMask & probe.renderingLayerMask == 0)
+            continue;
+
+        CompareInfo compareInfo;
+        compareInfo.probeIndex = i;
+        compareInfo.aabb.boxMin = probe.boxMin.xyz;
+        compareInfo.aabb.boxMax = probe.boxMax.xyz;
+        compareInfo.weight = CalculateProbeInfluence(objectAABB, compareInfo.aabb);
+        if (compareInfo.weight <= 0.0h)
+            continue;
+        
+        compareInfo.importance = probe.boxProjection_TextureValid_Importance & ((1u << VG_REFLECTION_PROBE_INFO_IMPORTANCE_BITS) - 1u);
+        
+        half3 dir = objectBoundsCenter - probe.probePosition.xyz;
+        compareInfo.distanceSqr = dot(dir, dir);
+
+        if (CompareProbeInfluence(compareInfo0, compareInfo))
+        {
+            compareInfo1 = compareInfo0;
+            compareInfo0 = compareInfo;
+        }
+        else if (CompareProbeInfluence(compareInfo1, compareInfo))
+        {
+            compareInfo1 = compareInfo;
+        }
+    }
+    // Lerp occurs in the fragment shading, here no need to calculate probe lerp on instance.
+    // half lerpValue = CalculateReflectionProbeLerpValue(compareInfo0, compareInfo1, objectAABB);
+
+    uint reflectionProbeParameter = PackReflectionProbeParam(compareInfo0.probeIndex, compareInfo1.probeIndex/*, lerpValue*/);
+    _RWInstanceSubsetBuffer[instanceID].reflectionProbeParameter = reflectionProbeParameter;
+
+#else
+    _RWInstanceSubsetBuffer[instanceID].reflectionProbeParameter = ~0u;
+#endif
+}
+
+[numthreads(1, 1, 1)]
+void InitReflectionProbeCull()
+{
+    // Count of Instance pass GPU culling store in the 1st element's instanceID
+    uint count = _InstanceIDBuffer[0].instanceID;
+    _ReflectionProbeCullArgsBuffer[0] = (count + THREAD_GROUP_SIZE_X - 1) / THREAD_GROUP_SIZE_X;
+    _ReflectionProbeCullArgsBuffer[1] = 1;
+    _ReflectionProbeCullArgsBuffer[2] = 1;
+}

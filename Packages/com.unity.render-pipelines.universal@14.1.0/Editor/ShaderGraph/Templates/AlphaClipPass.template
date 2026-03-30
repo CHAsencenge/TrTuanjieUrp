@@ -1,0 +1,176 @@
+﻿Pass
+{
+    $splice(PassName)
+    Tags
+    {
+        $splice(LightMode)
+    }
+
+// Render State
+$splice(RenderState)
+
+// Debug
+$splice(Debug)
+
+// --------------------------------------------------
+// Pass
+
+HLSLPROGRAM
+
+// Pragmas
+$splice(PassPragmas)
+
+// Keywords
+$splice(PassKeywords)
+$splice(GraphKeywords)
+
+#undef UNITY_GPU_DRIVEN_PIPELINE
+#define UNITY_GPU_DRIVEN_PIPELINE
+#undef MULTI_VIEW
+#define GPU_ALPHA_CLIP_ON
+
+// Defines
+$features.graphVFX: #define HAVE_VFX_MODIFICATION
+
+$Normal: #define _NORMALMAP 1
+$NormalDropOffTS: #define _NORMAL_DROPOFF_TS 1
+$NormalDropOffOS: #define _NORMAL_DROPOFF_OS 1
+$NormalDropOffWS: #define _NORMAL_DROPOFF_WS 1
+$Attributes.normalOS: #define ATTRIBUTES_NEED_NORMAL
+$Attributes.tangentOS: #define ATTRIBUTES_NEED_TANGENT
+$Attributes.uv0: #define ATTRIBUTES_NEED_TEXCOORD0
+$Attributes.uv1: #define ATTRIBUTES_NEED_TEXCOORD1
+$Attributes.uv2: #define ATTRIBUTES_NEED_TEXCOORD2
+$Attributes.uv3: #define ATTRIBUTES_NEED_TEXCOORD3
+$Attributes.color: #define ATTRIBUTES_NEED_COLOR
+$Attributes.vertexID: #define ATTRIBUTES_NEED_VERTEXID
+$Varyings.positionWS: #define VARYINGS_NEED_POSITION_WS
+$Varyings.normalWS: #define VARYINGS_NEED_NORMAL_WS
+$Varyings.tangentWS: #define VARYINGS_NEED_TANGENT_WS
+$Varyings.texCoord0: #define VARYINGS_NEED_TEXCOORD0
+$Varyings.texCoord1: #define VARYINGS_NEED_TEXCOORD1
+$Varyings.texCoord2: #define VARYINGS_NEED_TEXCOORD2
+$Varyings.texCoord3: #define VARYINGS_NEED_TEXCOORD3
+$Varyings.color: #define VARYINGS_NEED_COLOR
+$Varyings.elementToWorld0:  #define VARYINGS_NEED_ELEMENT_TO_WORLD
+$Varyings.worldToElement0:  #define VARYINGS_NEED_WORLD_TO_ELEMENT
+$Varyings.bitangentWS: #define VARYINGS_NEED_BITANGENT_WS
+$Varyings.screenPosition: #define VARYINGS_NEED_SCREENPOSITION
+$Varyings.fogFactorAndVertexLight: #define VARYINGS_NEED_FOG_AND_VERTEX_LIGHT
+$Varyings.shadowCoord: #define VARYINGS_NEED_SHADOW_COORD
+$Varyings.cullFace: #define VARYINGS_NEED_CULLFACE
+$features.graphVertex: #define FEATURES_GRAPH_VERTEX
+$Universal.UseLegacySpriteBlocks: #define UNIVERSAL_USELEGACYSPRITEBLOCKS
+$splice(PassInstancing)
+$splice(GraphDefines)
+$splice(DotsInstancingVars)
+
+// custom interpolator pre-include
+$splice(sgci_CustomInterpolatorPreInclude)
+
+// Includes
+#include_with_pragmas "GPUDataDecodeDefine.hlsl"
+#include "GPUDrivenCommon.hlsl"
+$splice(PreGraphIncludes)
+
+// --------------------------------------------------
+// Structs and Packing
+
+// custom interpolators pre packing
+$splice(CustomInterpolatorPrePacking)
+
+$splice(PassStructs)
+
+$splice(InterpolatorPack)
+
+// --------------------------------------------------
+// Graph
+
+// Graph Properties
+$splice(GraphProperties)
+
+// Graph Includes
+$splice(GraphIncludes)
+
+// -- Property used by ScenePickingPass
+#ifdef SCENEPICKINGPASS
+float4 _SelectionID;
+#endif
+
+// -- Properties used by SceneSelectionPass
+#ifdef SCENESELECTIONPASS
+int _ObjectId;
+int _PassValue;
+#endif
+
+// Graph Functions
+$splice(GraphFunctions)
+
+// Custom interpolators pre vertex
+$splice(CustomInterpolatorPreVertex)
+
+// Graph Vertex
+$splice(GraphVertex)
+
+// Custom interpolators, pre surface
+$splice(CustomInterpolatorPreSurface)
+
+// Graph Pixel
+$splice(GraphPixel)
+
+// --------------------------------------------------
+// Build Graph Inputs
+#ifdef HAVE_VFX_MODIFICATION
+#define VFX_SRP_ATTRIBUTES Attributes
+#define VFX_SRP_VARYINGS Varyings
+#define VFX_SRP_SURFACE_INPUTS SurfaceDescriptionInputs
+#endif
+$features.graphVFX: $include("VFXConfig.template.hlsl")
+$features.graphVertex:  $include("BuildVertexDescriptionInputs.template.hlsl")
+$features.graphVertex:  $include("VirtualGeometryVertex.template.hlsl")
+$features.graphPixel: $include("SharedCode.template.hlsl")
+
+// --------------------------------------------------
+// Alpha Clip (Specific Material)
+void GPUDrivenAlphaClip(Varyings input 
+    UNITY_GDRP_MATRIX_M_PARAMETER 
+    UNITY_GDRP_MATRIX_M_I_PARAMETER 
+    UNITY_GDRP_INSTANCE_PARAMETER 
+    UNITY_GDRP_INSTANCE_ID_PARAMETER
+    , uint materialOffset = 0)
+{
+    // Alpha Clip do not need ddx and ddy, so here just give zero.
+    PixelAttribute attribute = (PixelAttribute)0;
+
+    SurfaceDescriptionInputs surfaceDescriptionInputs = BuildSurfaceDescriptionInputs(input UNITY_GDRP_MATRIX_M_ARGUMENT UNITY_GDRP_MATRIX_M_I_ARGUMENT UNITY_GDRP_ATTRIBUTE_ARGUMENT);
+#if defined(HAVE_VFX_MODIFICATION)
+    GraphProperties properties;
+    ZERO_INITIALIZE(GraphProperties, properties);
+    GetElementPixelProperties(surfaceDescriptionInputs, properties);
+    SurfaceDescription surfaceDescription = SurfaceDescriptionFunction(surfaceDescriptionInputs UNITY_GDRP_INSTANCE_ARGUMENT UNITY_GDRP_INSTANCE_ID_ARGUMENT, properties);
+#else
+    SurfaceDescription surfaceDescription = SurfaceDescriptionFunction(surfaceDescriptionInputs UNITY_GDRP_INSTANCE_ARGUMENT UNITY_GDRP_INSTANCE_ID_ARGUMENT UNITY_GDRP_MATERIAL_PAGE_OFFSET_ARGUMENT);
+#endif
+
+    clip(surfaceDescription.Alpha - surfaceDescription.AlphaClipThreshold);
+}
+
+// --------------------------------------------------
+// Main
+#include "GPUVisibleBucketCommon.hlsl"
+$splice(PostGraphIncludes)
+
+#if defined(PROCEDURAL_INSTANCING_ON)
+void setup()
+{
+}
+#endif
+
+// --------------------------------------------------
+// Visual Effect Vertex Invocations
+#ifdef HAVE_VFX_MODIFICATION
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/VisualEffectVertex.hlsl"
+#endif
+
+ENDHLSL
+}
